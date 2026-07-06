@@ -5,6 +5,7 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -205,6 +206,24 @@ def _pa_prefill_ctx_tile(
 
 
 @gluon.jit
+def _pa_prefill_get_grid_ids(
+    NUM_XCDS: gl.constexpr,
+    USE_XCD_REMAP: gl.constexpr,
+    NUM_M_BLOCKS: gl.constexpr,
+):
+    """XCD-aware (batch, head, start_m) mapping — same idea as mla_gluon bh64 / v9 get_pids."""
+    if USE_XCD_REMAP:
+        cur_batch = gl.program_id(0) + (gl.program_id(2) // NUM_M_BLOCKS) * NUM_XCDS
+        cur_head = gl.program_id(1)
+        start_m = gl.program_id(2) % NUM_M_BLOCKS
+    else:
+        cur_batch = gl.program_id(0)
+        cur_head = gl.program_id(1)
+        start_m = gl.program_id(2)
+    return cur_batch, cur_head, start_m
+
+
+@gluon.jit
 def _fwd_kernel_gluon(
     Q,
     K,
@@ -261,10 +280,13 @@ def _fwd_kernel_gluon(
     WITHIN_2GB: gl.constexpr,
     HEAD_DIM_LOAD: gl.constexpr,
     USE_FULL_ASYNC_CTX: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    USE_XCD_REMAP: gl.constexpr,
+    NUM_M_BLOCKS: gl.constexpr,
 ):
-    cur_batch = gl.program_id(0)
-    cur_head = gl.program_id(1)
-    start_m = gl.program_id(2)
+    cur_batch, cur_head, start_m = _pa_prefill_get_grid_ids(
+        NUM_XCDS, USE_XCD_REMAP, NUM_M_BLOCKS
+    )
 
     cur_kv_head = cur_head // num_queries_per_kv
 
@@ -451,19 +473,49 @@ def _fwd_kernel_gluon(
             _pa_prefill_async_load_kv_slices(
                 bufs_k, bufs_v, bufs_page.index(async_idx), async_idx, start_n_load,
                 K_gluon, V_gluon, cur_kv_head, cur_batch_ctx_len, block_size,
-                stride_kv_slot, stride_kv_h, stride_kv_h,
+                stride_kv_slot, stride_kv_h,
                 blocked_kv_slice, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
             )
 
-            m_i, l_i, acc = _pa_prefill_ctx_tile(
-                q, bufs_k.index(buf_idx), bufs_v.index(buf_idx),
-                m_i, l_i, acc, mfma_layout, dot_a, dot_b, linear_v,
-                sm_scale, kv_scale_k, kv_scale_v,
-                tile_compute, cur_batch_ctx_len, cur_batch_seq_len, cur_batch_ctx_len,
-                offs_n_qk, offs_m_qk, alibi_slope,
-                BLOCK_M, BLOCK_N, IS_FP8_KV, SLIDING_WINDOW, USE_ALIBI,
-                True, HEAD_DIM_LOAD,
+            buf_k_cur = bufs_k.index(buf_idx)
+            buf_v_cur = bufs_v.index(buf_idx)
+            k_tile = buf_k_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=dot_b).to(q.dtype)
+            zeros = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+            qk = gl.amd.cdna4.mfma(q, k_tile, zeros)
+            qk = gl.where(
+                (tile_compute + offs_n_qk[None, :]) < cur_batch_ctx_len, qk, float("-inf")
             )
+            qk *= sm_scale
+            if SLIDING_WINDOW > 0:
+                qk = gl.where(
+                    (cur_batch_ctx_len + offs_m_qk[:, None]) - (tile_compute + offs_n_qk[None, :])
+                    < SLIDING_WINDOW,
+                    qk,
+                    -10000.0,
+                )
+            if USE_ALIBI:
+                alibi_start_q = offs_m_qk + cur_batch_ctx_len
+                alibi = (
+                    offs_n_qk[None, :] + tile_compute - alibi_start_q[:, None]
+                ) * alibi_slope
+                alibi = gl.where(
+                    (alibi <= 0) & (alibi_start_q[:, None] < cur_batch_seq_len),
+                    alibi,
+                    float("-inf"),
+                )
+                qk += alibi
+            m_ij = gl.max(qk, 1)
+            m_i_new = gl.maximum(m_i, m_ij)
+            alpha = gl.exp2((m_i - m_i_new) * LOG2E)
+            p = gl.exp2((qk - m_i_new[:, None]) * LOG2E)
+            l_i = l_i * alpha + gl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            v_raw = buf_v_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=blocked_kt)
+            v_c = gl.permute(v_raw, [1, 0])
+            v_c = gl.convert_layout(v_c.to(q.dtype), dot_b)
+            p_dot = gl.convert_layout(p.to(q.dtype), dot_a)
+            acc = gl.amd.cdna4.mfma(p_dot, v_c, acc)
+            m_i = m_i_new
 
             start_n += BLOCK_N
             start_n_load += BLOCK_N
@@ -478,33 +530,93 @@ def _fwd_kernel_gluon(
                 _pa_prefill_async_load_kv_slices(
                     bufs_k, bufs_v, bufs_page.index(async_idx), async_idx, start_n_load,
                     K_gluon, V_gluon, cur_kv_head, cur_batch_ctx_len, block_size,
-                    stride_kv_slot, stride_kv_h, stride_kv_h,
+                    stride_kv_slot, stride_kv_h,
                     blocked_kv_slice, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
                 )
 
-            m_i, l_i, acc = _pa_prefill_ctx_tile(
-                q, bufs_k.index(buf_idx), bufs_v.index(buf_idx),
-                m_i, l_i, acc, mfma_layout, dot_a, dot_b, linear_v,
-                sm_scale, kv_scale_k, kv_scale_v,
-                tile_compute, cur_batch_ctx_len, cur_batch_seq_len, cur_batch_ctx_len,
-                offs_n_qk, offs_m_qk, alibi_slope,
-                BLOCK_M, BLOCK_N, IS_FP8_KV, SLIDING_WINDOW, USE_ALIBI,
-                True, HEAD_DIM_LOAD,
+            buf_k_cur = bufs_k.index(buf_idx)
+            buf_v_cur = bufs_v.index(buf_idx)
+            k_tile = buf_k_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=dot_b).to(q.dtype)
+            zeros = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+            qk = gl.amd.cdna4.mfma(q, k_tile, zeros)
+            qk = gl.where(
+                (tile_compute + offs_n_qk[None, :]) < cur_batch_ctx_len, qk, float("-inf")
             )
+            qk *= sm_scale
+            if SLIDING_WINDOW > 0:
+                qk = gl.where(
+                    (cur_batch_ctx_len + offs_m_qk[:, None]) - (tile_compute + offs_n_qk[None, :])
+                    < SLIDING_WINDOW,
+                    qk,
+                    -10000.0,
+                )
+            if USE_ALIBI:
+                alibi_start_q = offs_m_qk + cur_batch_ctx_len
+                alibi = (
+                    offs_n_qk[None, :] + tile_compute - alibi_start_q[:, None]
+                ) * alibi_slope
+                alibi = gl.where(
+                    (alibi <= 0) & (alibi_start_q[:, None] < cur_batch_seq_len),
+                    alibi,
+                    float("-inf"),
+                )
+                qk += alibi
+            m_ij = gl.max(qk, 1)
+            m_i_new = gl.maximum(m_i, m_ij)
+            alpha = gl.exp2((m_i - m_i_new) * LOG2E)
+            p = gl.exp2((qk - m_i_new[:, None]) * LOG2E)
+            l_i = l_i * alpha + gl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            v_raw = buf_v_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=blocked_kt)
+            v_c = gl.permute(v_raw, [1, 0])
+            v_c = gl.convert_layout(v_c.to(q.dtype), dot_b)
+            p_dot = gl.convert_layout(p.to(q.dtype), dot_a)
+            acc = gl.amd.cdna4.mfma(p_dot, v_c, acc)
+            m_i = m_i_new
             tile_compute += BLOCK_N
             buf_idx = async_idx
 
         ################ epilogue 2
         gl.amd.cdna4.async_copy.wait_group(0)
-        m_i, l_i, acc = _pa_prefill_ctx_tile(
-            q, bufs_k.index(buf_idx), bufs_v.index(buf_idx),
-            m_i, l_i, acc, mfma_layout, dot_a, dot_b, linear_v,
-            sm_scale, kv_scale_k, kv_scale_v,
-            tile_compute, cur_batch_ctx_len, cur_batch_seq_len, cur_batch_ctx_len,
-            offs_n_qk, offs_m_qk, alibi_slope,
-            BLOCK_M, BLOCK_N, IS_FP8_KV, SLIDING_WINDOW, USE_ALIBI,
-            True, HEAD_DIM_LOAD,
+        buf_k_cur = bufs_k.index(buf_idx)
+        buf_v_cur = bufs_v.index(buf_idx)
+        k_tile = buf_k_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=dot_b).to(q.dtype)
+        zeros = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q, k_tile, zeros)
+        qk = gl.where(
+            (tile_compute + offs_n_qk[None, :]) < cur_batch_ctx_len, qk, float("-inf")
         )
+        qk *= sm_scale
+        if SLIDING_WINDOW > 0:
+            qk = gl.where(
+                (cur_batch_ctx_len + offs_m_qk[:, None]) - (tile_compute + offs_n_qk[None, :])
+                < SLIDING_WINDOW,
+                qk,
+                -10000.0,
+            )
+        if USE_ALIBI:
+            alibi_start_q = offs_m_qk + cur_batch_ctx_len
+            alibi = (
+                offs_n_qk[None, :] + tile_compute - alibi_start_q[:, None]
+            ) * alibi_slope
+            alibi = gl.where(
+                (alibi <= 0) & (alibi_start_q[:, None] < cur_batch_seq_len),
+                alibi,
+                float("-inf"),
+            )
+            qk += alibi
+        m_ij = gl.max(qk, 1)
+        m_i_new = gl.maximum(m_i, m_ij)
+        alpha = gl.exp2((m_i - m_i_new) * LOG2E)
+        p = gl.exp2((qk - m_i_new[:, None]) * LOG2E)
+        l_i = l_i * alpha + gl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        v_raw = buf_v_cur.slice(0, BLOCK_DMODEL_PADDED, 0).load(layout=blocked_kt)
+        v_c = gl.permute(v_raw, [1, 0])
+        v_c = gl.convert_layout(v_c.to(q.dtype), dot_b)
+        p_dot = gl.convert_layout(p.to(q.dtype), dot_a)
+        acc = gl.amd.cdna4.mfma(p_dot, v_c, acc)
+        m_i = m_i_new
 
     elif cur_batch_ctx_len > 0:
         bn0 = gl.load(
@@ -780,7 +892,13 @@ def context_attention_fwd_gluon(
         BLOCK_N_cfg = 64
         WARP_M = 4
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
+    num_m_blocks = triton.cdiv(max_input_len, BLOCK)
+    NUM_XCDS = get_num_xcds()
+    USE_XCD_REMAP = batch % NUM_XCDS == 0
+    if USE_XCD_REMAP:
+        grid = (NUM_XCDS, head, (batch // NUM_XCDS) * num_m_blocks)
+    else:
+        grid = (batch, head, num_m_blocks)
 
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
@@ -799,7 +917,9 @@ def context_attention_fwd_gluon(
     within_2gb = max_kv_bytes <= 0x80000000
 
     use_full_async = (
-        not is_fp8_kv
+        # 2x double-buffered [512, BLOCK_N] K/V smem exceeds gfx950 160KB LDS.
+        False
+        and not is_fp8_kv
         and not q_dtype_is_f32
         and Lk == 128
         and BLOCK == 64
@@ -875,6 +995,9 @@ def context_attention_fwd_gluon(
         WITHIN_2GB=within_2gb,
         HEAD_DIM_LOAD=head_dim_load,
         USE_FULL_ASYNC_CTX=use_full_async,
+        NUM_XCDS=NUM_XCDS,
+        USE_XCD_REMAP=USE_XCD_REMAP,
+        NUM_M_BLOCKS=num_m_blocks,
         num_warps=WARP_M,
         num_stages=1,
     )
