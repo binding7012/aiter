@@ -15,8 +15,8 @@ _LOGGER = AiterTritonLogger()
 _HEAD_DIM_ASYNC_LOAD: int = 512
 
 
-def _kv_to_slot_linear_pad512(k_cache, v_cache):
-    """Convert split-K / blocked-V paged caches to slot-major [slots, heads, 512]."""
+def _kv_to_slot_linear_pad(k_cache, v_cache, pad_dim: int):
+    """Convert split-K / blocked-V paged caches to slot-major [slots, heads, pad_dim]."""
     block_size = k_cache.shape[3]
     num_kv_heads = k_cache.shape[1]
     head_dim = k_cache.shape[2] * k_cache.shape[4]
@@ -30,11 +30,11 @@ def _kv_to_slot_linear_pad512(k_cache, v_cache):
         .reshape(v_cache.shape[0] * block_size, num_kv_heads, head_dim)
         .contiguous()
     )
-    if head_dim < _HEAD_DIM_ASYNC_LOAD:
+    if head_dim < pad_dim:
         k_pad = torch.zeros(
             k_lin.shape[0],
             num_kv_heads,
-            _HEAD_DIM_ASYNC_LOAD,
+            pad_dim,
             dtype=k_lin.dtype,
             device=k_lin.device,
         )
@@ -43,6 +43,10 @@ def _kv_to_slot_linear_pad512(k_cache, v_cache):
         v_pad[:, :, :head_dim] = v_lin
         return k_pad, v_pad
     return k_lin, v_lin
+
+
+def _kv_to_slot_linear_pad512(k_cache, v_cache):
+    return _kv_to_slot_linear_pad(k_cache, v_cache, _HEAD_DIM_ASYNC_LOAD)
 
 
 @gluon.jit
@@ -60,6 +64,7 @@ def _pa_prefill_async_load_kv_slices(
     stride_slot,
     stride_h,
     blocked_kv_slice: gl.constexpr,
+    blocked_page: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_N_HALF: gl.constexpr,
     HEAD_DIM_LOAD: gl.constexpr,
@@ -73,7 +78,7 @@ def _pa_prefill_async_load_kv_slices(
     buf_page_1 = buf_page.slice(BLOCK_N_HALF, BLOCK_N_HALF, 0)
 
     page_bn_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        buf_page_0, gl.SliceLayout(0, blocked_kv_slice)
+        buf_page_0, gl.SliceLayout(0, blocked_page)
     )
     slot_0 = page_bn_0 * block_size + (
         tile_start + gl.arange(0, BLOCK_N_HALF, layout=gl.SliceLayout(0, blocked_kv_slice))
@@ -98,7 +103,7 @@ def _pa_prefill_async_load_kv_slices(
         gl.amd.cdna4.async_copy.commit_group()
 
     page_bn_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        buf_page_1, gl.SliceLayout(0, blocked_kv_slice)
+        buf_page_1, gl.SliceLayout(0, blocked_page)
     )
     slot_1 = page_bn_1 * block_size + (
         tile_start + BLOCK_N_HALF
@@ -373,36 +378,54 @@ def _fwd_kernel_gluon(
         num_ctx_iter = gl.cdiv(cur_batch_ctx_len, BLOCK_N)
         gl.assume(num_ctx_iter >= 3)
 
-        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
-            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[HEAD_DIM_LOAD, BLOCK_N],
-        )
-        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
-            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[HEAD_DIM_LOAD, BLOCK_N_HALF],
-        )
-        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[HEAD_DIM_LOAD, 16]],
-            offset_bases=[
-                [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0],
-                [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32],
-            ],
-            cga_layout=[],
-            shape=[HEAD_DIM_LOAD, BLOCK_N],
-        )
-        linear_v: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (64, 0), (128, 0), (256, 0)),
-            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-            warp_bases=((0, 0), (0, 0)),
-            block_bases=[],
-            shape=[HEAD_DIM_LOAD, BLOCK_N],
-        )
+        if HEAD_DIM_LOAD <= 64:
+            blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
+                lane_bases=((8, 0), (16, 0), (32, 0)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N],
+            )
+            blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
+                lane_bases=((8, 0), (16, 0), (32, 0)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N_HALF],
+            )
+            shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[HEAD_DIM_LOAD, 16]],
+                offset_bases=[
+                    [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
+                    [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32],
+                ],
+                cga_layout=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N],
+            )
+        else:
+            blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
+                lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N],
+            )
+            blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
+                lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N_HALF],
+            )
+            shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[HEAD_DIM_LOAD, 16]],
+                offset_bases=[
+                    [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0],
+                    [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32],
+                ],
+                cga_layout=[],
+                shape=[HEAD_DIM_LOAD, BLOCK_N],
+            )
         blocked_page: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0,),),
             lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
@@ -452,7 +475,7 @@ def _fwd_kernel_gluon(
             bufs_k, bufs_v, bufs_page.index(0), 0, 0,
             K_gluon, V_gluon, cur_kv_head, cur_batch_ctx_len, block_size,
             stride_kv_slot, stride_kv_h,
-            blocked_kv_slice, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
+            blocked_kv_slice, blocked_page, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
         )
 
         buf_idx = 0
@@ -474,7 +497,7 @@ def _fwd_kernel_gluon(
                 bufs_k, bufs_v, bufs_page.index(async_idx), async_idx, start_n_load,
                 K_gluon, V_gluon, cur_kv_head, cur_batch_ctx_len, block_size,
                 stride_kv_slot, stride_kv_h,
-                blocked_kv_slice, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
+                blocked_kv_slice, blocked_page, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
             )
 
             buf_k_cur = bufs_k.index(buf_idx)
@@ -531,7 +554,7 @@ def _fwd_kernel_gluon(
                     bufs_k, bufs_v, bufs_page.index(async_idx), async_idx, start_n_load,
                     K_gluon, V_gluon, cur_kv_head, cur_batch_ctx_len, block_size,
                     stride_kv_slot, stride_kv_h,
-                    blocked_kv_slice, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
+                    blocked_kv_slice, blocked_page, BLOCK_N, BLOCK_N_HALF, HEAD_DIM_LOAD, WITHIN_2GB,
                 )
 
             buf_k_cur = bufs_k.index(buf_idx)
@@ -886,7 +909,7 @@ def context_attention_fwd_gluon(
     elif Lk_padded <= 64:
         BLOCK = 256
         BLOCK_N_cfg = 64
-        WARP_M = 8
+        WARP_M = 4
     else:
         BLOCK = 128
         BLOCK_N_cfg = 64
@@ -916,28 +939,12 @@ def context_attention_fwd_gluon(
     max_kv_bytes = k_cache.shape[0] * k_cache.stride(0) * k_cache.element_size()
     within_2gb = max_kv_bytes <= 0x80000000
 
-    use_full_async = (
-        # 2x double-buffered [512, BLOCK_N] K/V smem exceeds gfx950 160KB LDS.
-        False
-        and not is_fp8_kv
-        and not q_dtype_is_f32
-        and Lk == 128
-        and BLOCK == 64
-        and BLOCK_N_cfg == 64
-        and WARP_M == 4
-    )
-    if use_full_async:
-        k_gluon, v_gluon = _kv_to_slot_linear_pad512(k_cache, v_cache)
-        num_kv_heads = k_cache.shape[1]
-        stride_kv_slot = num_kv_heads * _HEAD_DIM_ASYNC_LOAD
-        stride_kv_h = _HEAD_DIM_ASYNC_LOAD
-        head_dim_load = _HEAD_DIM_ASYNC_LOAD
-    else:
-        k_gluon = k_cache
-        v_gluon = v_cache
-        stride_kv_slot = 0
-        stride_kv_h = 0
-        head_dim_load = Lk_padded
+    use_full_async = False
+    k_gluon = k_cache
+    v_gluon = v_cache
+    stride_kv_slot = 0
+    stride_kv_h = 0
+    head_dim_load = Lk_padded
 
     _fwd_kernel_gluon[grid](
         q,
