@@ -5,7 +5,7 @@ import math
 import random
 import pytest
 import torch
-from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
+from aiter.ops.triton.gluon.pa_prefill_gluon import context_attention_fwd_gluon as context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 NUM_HEADS = [64]
@@ -393,6 +393,101 @@ def test_contexted_kv_attention(
     )
 
     torch.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+
+
+# Benchmark shapes from op_benchmarks/triton/bench_pa_prefill.py (llama3 + deepseek)
+BENCHMARK_SHAPE_CONFIGS = [
+  # model_name, BS, num_heads, num_kv_heads, MAX_SEQ_LEN, head_size
+  ("llama3-8B", 16, 32, 8, 1024, 128),
+  ("llama3-70B", 16, 64, 8, 1024, 128),
+  ("llama3-405B", 16, 128, 8, 1024, 128),
+  ("deepseek-V3", 16, 128, 128, 1024, 56),
+]
+
+
+@pytest.mark.parametrize(
+  "model_name,bs,num_heads,num_kv_heads,max_seq_len,head_size",
+  BENCHMARK_SHAPE_CONFIGS,
+)
+@torch.inference_mode()
+def test_contexted_kv_attention_benchmark_shapes(
+  model_name: str,
+  bs: int,
+  num_heads: int,
+  num_kv_heads: int,
+  max_seq_len: int,
+  head_size: int,
+) -> None:
+  device = "cuda:0"
+  num_queries_per_kv = num_heads // num_kv_heads
+  max_block_per_request = 1024
+  block_size = max_seq_len // max_block_per_request
+  cache_size = max_block_per_request * bs
+  dtype = torch.float16
+  kv_cache_dtype = "auto"
+
+  torch.cuda.empty_cache()
+  (
+    query,
+    k,
+    v,
+    output,
+    k_cache,
+    v_cache,
+    block_table,
+    b_start_loc,
+    b_seq_len,
+    max_input_len,
+    k_scale,
+    v_scale,
+    _,
+  ) = input_helper(
+    BS=bs,
+    MAX_SEQ_LEN=max_seq_len,
+    MAX_CTX_LEN=max_seq_len,
+    cache_size=cache_size,
+    block_size=block_size,
+    max_block_per_request=max_block_per_request,
+    num_heads=num_heads,
+    head_size=head_size,
+    num_queries_per_kv=num_queries_per_kv,
+    dtype=dtype,
+    kv_cache_dtype=kv_cache_dtype,
+    device=device,
+    use_alibi_slope=False,
+  )
+  output_torch = torch.empty_like(output)
+  output_triton = output
+
+  context_attention_fwd(
+    query,
+    k,
+    v,
+    output_triton,
+    kv_cache_dtype,
+    k_cache,
+    v_cache,
+    block_table,
+    b_start_loc,
+    b_seq_len,
+    max_input_len,
+    k_scale,
+    v_scale,
+  )
+  context_attention_fwd_torch(
+    query,
+    k,
+    v,
+    output_torch,
+    k_cache,
+    v_cache,
+    b_start_loc,
+    b_seq_len,
+    k_scale,
+    v_scale,
+  )
+
+  torch.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

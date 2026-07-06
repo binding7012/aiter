@@ -4,7 +4,7 @@ import math
 import random
 import triton
 
-from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
+from aiter.ops.triton.gluon.pa_prefill_gluon import context_attention_fwd_gluon as context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
